@@ -1,0 +1,3 @@
+stable-ts>=2.17       # Whisper forced alignment (kéo theo torch + openai-whisper)
+librosa>=0.10         # dò BPM (tuỳ chọn)
+# demucs>=4.0         # bỏ comment nếu dùng --separate (tách vocal trước khi căn)
