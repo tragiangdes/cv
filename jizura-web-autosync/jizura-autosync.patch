@@ -1,0 +1,363 @@
+diff --git a/app/style.css b/app/style.css
+index 4ae8115..df502d1 100644
+--- a/app/style.css
++++ b/app/style.css
+@@ -440,3 +440,4 @@ button.small.primary { padding: 4px 12px; }
+ /* layout menus are filled on first use: keep their width fixed so nothing jumps */
+ .ln .cuts select.cut-lay { width: 112px; }
+ .ln .tools select.lay { width: 112px; }
++.jz-auto-status { font-size: 12px; overflow-wrap: anywhere; line-height: 1.45; margin-top: 4px; }
+diff --git a/src/08_planner.js b/src/08_planner.js
+index d1e3b45..d4acf9b 100644
+--- a/src/08_planner.js
++++ b/src/08_planner.js
+@@ -203,6 +203,14 @@ J.phraseChunks = (words) => {
+ };
+ 
+ /* ---------------- timing ---------------- */
++// 自動同期 (auto sync): vocal times aligned from the song — { s: start, e: singing ends, c: [time of each non-space
++// character], t: line text }. Used only while the line still starts where the aligner put it and its text is unchanged,
++// so a line moved by hand (tap / drag / typed time) or edited goes back to the usual proportional cuts.
++J.autoTiming = (project, li, ln, s) => {
++  const A = project.timing && project.timing.auto, a = A && A[li];
++  if (!a || !Array.isArray(a.c) || !a.c.length || a.t !== ln.text || !isFinite(a.s) || !isFinite(a.e) || Math.abs(a.s - s) > 0.02 || !a.c.every(isFinite)) return null;
++  return a;
++};
+ J.computeTiming = (project, parsed, audio) => {
+   const T = project.timing || {};
+   const lines = parsed.lines;
+@@ -249,7 +257,8 @@ J.computeTiming = (project, parsed, audio) => {
+     const n = [...lines[i].text].length, L = lines[i];
+     let d = L.interlude ? (L.secs > 0 ? L.secs : 4) : J.clamp(0.8 + n * 0.17, 1.5, 5.2) * (T.lineScale || 1);
+     if (beat && !(L.interlude && L.secs > 0)) d = Math.max(2, Math.round(d / beat)) * beat;
+-    return s + d;
++    const AU = !L.interlude && J.autoTiming(project, i, L, s);       // 自動同期: the last line lasts until it is sung
++    return AU ? Math.max(s + d, AU.e + 0.8) : s + d;
+   });
+   let duration = (ends.length ? ends[ends.length - 1] : 3) + (T.tail ?? 0.9);
+   if (audio && audio.duration && T.useAudioLength !== false) duration = Math.max(audio.duration, ends.length ? ends[ends.length - 1] + 0.2 : 1);
+@@ -345,7 +354,9 @@ J.plan = (project, audio) => {
+       return;
+     }
+     const n = [...ln.text.replace(/\s+/g, '')].length;
+-    const visEnd = Math.min(e, s + Math.max(3.6, n * 0.5 + 1.2));
++    const AU = J.autoTiming(project, li, ln, s);
++    // with vocal times the line stays until the singing ends (plus a short tail), not a length guessed from its characters
++    const visEnd = AU ? Math.min(e, Math.max(AU.e + J.clamp((e - AU.e) * 0.3, 0.2, 0.8), s + 0.6)) : Math.min(e, s + Math.max(3.6, n * 0.5 + 1.2));
+     const D = visEnd - s;
+     plan.lines.push({ index: li, src: ln.src, lrc: ln.lrc, text: ln.text, start: s, end: e, visEnd, note: ln.note, impact: ln.impact, emph: ln.emph, chunks: null, seed: lineSeed });
+     const chunks = ln.manual || (plan.lang === 'en' ? J.phraseChunks(J.chunkText(ln.text)) : J.chunkText(ln.text));
+@@ -369,7 +380,7 @@ J.plan = (project, audio) => {
+     else groups = partition(chunks2, nG).map(g => J.joinWords(g));
+     const recap = !fixedN && nC > groups.length && groups.length >= 2;
+     let units = groups.map(g => ({ text: g, w: [...g].length + 1.6 }));
+-    if (recap) units.push({ text: ln.text, w: (units.reduce((a, u) => a + u.w, 0) / units.length) * 1.25, recap: true });
++    if (recap && !(AU && visEnd - AU.e < 0.7)) units.push({ text: ln.text, w: (units.reduce((a, u) => a + u.w, 0) / units.length) * 1.25, recap: true });
+     // a locked line keeps its own cuts too (the cut count would otherwise follow the 細かさ slider or おまかせ)
+     if (ov.lock && Array.isArray(ov.lockedCuts) && ov.lockedCuts.length && ov.lockedCuts.every(c => c && typeof c.utext === 'string' && ln.text.includes(c.utext.trim())))
+       units = ov.lockedCuts.map(c => ({ text: c.utext, w: [...c.utext].length + 1.6, recap: !!c.recap }));
+@@ -388,6 +399,18 @@ J.plan = (project, audio) => {
+       for (let k = 1; k < nb; k++) if (bounds[k] < bounds[k - 1] + 0.22) bounds[k] = bounds[k - 1] + 0.22;
+       for (let k = nb - 1; k >= 1; k--) if (bounds[k] > bounds[k + 1] - 0.22) bounds[k] = bounds[k + 1] - 0.22;
+     }
++    // 自動同期: each cut starts when its first character is sung (a recap when the singing ends); hand-set cut times win
++    if (AU) {
++      const nb = bounds.length - 1, b2 = bounds.slice();
++      let idx = 0, ok = true;
++      for (let k = 1; k < nb && ok; k++) {
++        idx += [...units[k - 1].text.replace(/\s+/g, '')].length;
++        if (!(ov.cutTime && ov.cutTime[k] != null)) b2[k] = units[k].recap ? AU.e : AU.c[Math.min(idx, AU.c.length - 1)];
++        b2[k] = Math.max(b2[k], b2[k - 1] + 0.15);
++        if (b2[k] > visEnd - 0.15 * (nb - k)) ok = false;
++      }
++      if (ok) for (let k = 1; k < nb; k++) bounds[k] = b2[k];
++    }
+     // scheme per line
+     if (nSchemes > 1 && li > 0 && (U ? U.sectionStart(li) && rng.chance(0.25 + fx.bgSwitch) : rng.chance(fx.bgSwitch * (ln.impact ? 1.8 : 1)))) schemeIdx = (schemeIdx + 1 + rng.int(0, nSchemes - 2)) % nSchemes;
+     const emphLine = ln.impact || ln.emph.length > 0;
+diff --git a/src/12_ui.js b/src/12_ui.js
+index 10b955e..c7e5846 100644
+--- a/src/12_ui.js
++++ b/src/12_ui.js
+@@ -1605,7 +1605,7 @@ function bind() {
+   $('offset').addEventListener('change', e => { S.project.timing.offset = Math.max(0, parseFloat(e.target.value) || 0); replan(); });
+   $('lineScale').addEventListener('change', e => { S.project.timing.lineScale = J.clamp(parseFloat(e.target.value) || 1, 0.3, 4); replan(); });
+   $('snap').addEventListener('change', e => { S.project.timing.snap = e.target.checked; replan(); });
+-  $('btnResetTimes').addEventListener('click', () => { S.project.timing.lineTimes = {}; replan(); });
++  $('btnResetTimes').addEventListener('click', () => { S.project.timing.lineTimes = {}; S.project.timing.auto = {}; replan(); });
+   $('audioFile').addEventListener('change', e => { const f = e.target.files && e.target.files[0]; if (f) loadAudioFile(f); });
+   $('btnTap').addEventListener('click', () => (S.tap ? stopTap() : startTap()));
+   $('tapBtn').addEventListener('click', tapNow);
+diff --git a/src/12b_autosync.js b/src/12b_autosync.js
+new file mode 100644
+index 0000000..a6c6c36
+--- /dev/null
++++ b/src/12b_autosync.js
+@@ -0,0 +1,267 @@
++/* ============================================================
++   JIZURA — auto sync: align the lyrics to the song in the browser (Whisper via transformers.js, word timestamps)
++   and export a one-click After Effects script (the AE panel's engine + this plan + the song)
++   ============================================================ */
++(() => {
++'use strict';
++if (!document.getElementById('app')) return;          // engine-only pages (tests)
++const $ = id => document.getElementById(id);
++const TF_URL = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.1';
++const MODELS = [['onnx-community/whisper-base_timestamped', 'Whisper base'], ['onnx-community/whisper-small_timestamped', 'Whisper small']];
++const COPY = {
++  ja: { sync: '歌詞を自動同期', jsx: 'AE スクリプト (.jsx)', model: '認識モデル', noAudio: '先に曲を読み込んでください', noLyrics: '歌詞がありません',
++    load: p => `モデルを読み込み中… ${p}%（初回のみ。以後はブラウザに保存）`, prep: '音声を準備中…', run: s => `歌詞の位置を解析中… ${s}秒`,
++    done: (n, r) => `${n}行を同期しました（文字の一致 ${r}%）。ずれた行はタップ・ドラッグで直せます。「手動タイミングを消す」で元に戻ります`,
++    low: '一致率が低いため、歌詞と曲が合っているか確認してください', fail: m => '自動同期できませんでした: ' + m,
++    jsxGet: 'AE パネルのエンジンを取得中…', jsxDone: n => `${n} を保存しました。After Effects の「ファイル › スクリプト › スクリプトファイルを実行」で開き、曲ファイルを同じフォルダに置いてください`,
++    jsxFail: 'AE パネル（JIZURA_AE.jsx）を取得できませんでした。JIZURA_AE.jsx を選んでください', tipSync: '曲を聴き取り、各行・各カットの開始を歌声に合わせます（ブラウザ内で処理・曲は送信しません）',
++    tipJsx: 'AE パネルなしで実行できる 1 ファイルのスクリプト。曲を読み込み、このプランのコンポを作ります' },
++  en: { sync: 'Auto-sync lyrics', jsx: 'AE script (.jsx)', model: 'Speech model', noAudio: 'Load a song first', noLyrics: 'No lyrics',
++    load: p => `Loading the model… ${p}% (first time only, then cached in this browser)`, prep: 'Preparing audio…', run: s => `Listening for the lyrics… ${s}s`,
++    done: (n, r) => `Synced ${n} lines (characters matched: ${r}%). Fix any line by tapping or dragging; "Clear manual timing" undoes it`,
++    low: 'Low match rate: check that the lyrics belong to this song', fail: m => 'Auto-sync failed: ' + m,
++    jsxGet: 'Fetching the AE panel engine…', jsxDone: n => `Saved ${n}. In After Effects: File › Scripts › Run Script File…, with the song in the same folder`,
++    jsxFail: 'Could not fetch the AE panel (JIZURA_AE_en.jsx). Please choose the file', tipSync: 'Listens to the song and puts every line and cut start on the vocals (runs in this browser; the song is not uploaded)',
++    tipJsx: 'A single script that runs without the AE panel: imports the song and builds this plan as a comp' },
++  vi: { sync: 'Tự căn lời (AI)', jsx: 'Xuất script AE (.jsx)', model: 'Model nhận dạng', noAudio: 'Hãy chọn tệp nhạc trước', noLyrics: 'Chưa có lời bài hát',
++    load: p => `Đang tải model… ${p}% (chỉ lần đầu, sau đó lưu trong trình duyệt)`, prep: 'Đang chuẩn bị âm thanh…', run: s => `Đang nghe và căn lời… ${s} giây`,
++    done: (n, r) => `Đã căn ${n} câu (khớp ${r}% ký tự). Câu nào lệch có thể bấm nhịp hoặc kéo lại; "Xóa thời gian thủ công" để hoàn tác`,
++    low: 'Tỉ lệ khớp thấp — kiểm tra lời có đúng bài hát này không', fail: m => 'Không tự căn được: ' + m,
++    jsxGet: 'Đang lấy engine của panel AE…', jsxDone: n => `Đã lưu ${n}. Trong After Effects: File › Scripts › Run Script File…, đặt file nhạc cùng thư mục`,
++    jsxFail: 'Không tải được panel AE (JIZURA_AE_en.jsx). Hãy chọn file đó', tipSync: 'Nghe bài hát và đặt điểm bắt đầu của từng câu, từng cảnh đúng vào giọng hát (xử lý trong trình duyệt, không tải nhạc lên mạng)',
++    tipJsx: 'Một file script chạy được không cần panel AE: tự import nhạc và dựng comp theo bố cục hiện tại' },
++};
++const L = () => COPY[document.documentElement.lang] || COPY.en;
++
++/* ---------------- lyric characters <-> recognised words ---------------- */
++const charsOf = t => [...String(t).replace(/\s+/g, '')];
++J.autoGuessLang = text => /[぀-ヿ]/.test(text) ? 'japanese' : /[가-힯]/.test(text) ? 'korean' : /[一-鿿]/.test(text) ? 'chinese'
++  : /[ăâđêôơưạảấầẩẫậắằẳẵặẹẻẽếềểễệỉịọỏốồổỗộớờởỡợụủứừửữựỳỵỷỹ]/i.test(text) ? 'vietnamese' : 'english';
++
++// global alignment (match +2, mismatch / gap −1): index into A for every character of B, or −1
++function alignChars(A, B) {
++  const n = A.length, m = B.length, W = m + 1, dir = new Uint8Array((n + 1) * W);
++  let prev = new Int32Array(W), cur = new Int32Array(W);
++  for (let j = 1; j <= m; j++) { prev[j] = -j; dir[j] = 2; }
++  for (let i = 1; i <= n; i++) {
++    cur[0] = -i; dir[i * W] = 1;
++    for (let j = 1; j <= m; j++) {
++      const d = prev[j - 1] + (A[i - 1] === B[j - 1] ? 2 : -1), u = prev[j] - 1, l = cur[j - 1] - 1;
++      if (d >= u && d >= l) { cur[j] = d; dir[i * W + j] = 0; } else if (u >= l) { cur[j] = u; dir[i * W + j] = 1; } else { cur[j] = l; dir[i * W + j] = 2; }
++    }
++    [prev, cur] = [cur, prev];
++  }
++  const map = new Int32Array(m).fill(-1), same = new Uint8Array(m);
++  let i = n, j = m;
++  while (i > 0 && j > 0) {
++    const d = dir[i * W + j];
++    if (d === 0) { map[j - 1] = i - 1; same[j - 1] = A[i - 1] === B[j - 1] ? 1 : 0; i--; j--; } else if (d === 1) i--; else j--;
++  }
++  return { map, same };
++}
++
++// recognised chunks [{text, timestamp:[s, e]}] + plan lines -> per line { s, e, c[], t }, and the share of matched characters
++J.autoTimes = (chunks, lines, lead = 0.12) => {
++  const A = [], At = [];
++  for (const ch of chunks) {
++    const cs = charsOf(ch.text || ''); if (!cs.length || !ch.timestamp) continue;
++    const s = +ch.timestamp[0], e = Math.max(ch.timestamp[1] != null ? +ch.timestamp[1] : s + 0.3, s + 0.01);
++    if (!isFinite(s)) continue;
++    cs.forEach((c, k) => { A.push(c.toLowerCase()); At.push([s + (e - s) * k / cs.length, s + (e - s) * (k + 1) / cs.length]); });
++  }
++  const B = [], owner = [];
++  lines.forEach((ln, li) => { if (!ln.interlude) for (const c of charsOf(ln.text)) { B.push(c.toLowerCase()); owner.push(li); } });
++  if (!A.length || !B.length) throw new Error('no speech recognised');
++  const { map, same } = alignChars(A, B), T = new Array(B.length).fill(null);
++  let hits = 0;
++  for (let b = 0; b < B.length; b++) if (map[b] >= 0) { T[b] = At[map[b]]; hits += same[b]; }
++  fillGaps(T, owner);
++  const per = lines.map(() => []);
++  owner.forEach((li, b) => per[li].push(T[b]));
++  const out = {}; let prevEnd = 0;
++  lines.forEach((ln, li) => {
++    if (ln.interlude) { out[li] = { interlude: true, s: prevEnd + 0.3 }; return; }
++    const ts = per[li]; if (!ts.length) return;
++    let c = ts.map(t => Math.max(0, +(t[0] - lead).toFixed(3)));
++    for (let k = 1; k < c.length; k++) c[k] = Math.max(c[k], c[k - 1]);
++    const s = Math.max(c[0], prevEnd - lead);
++    c = c.map(x => Math.max(x, s));
++    const e = +Math.max(ts[ts.length - 1][1], s + 0.3).toFixed(3);
++    out[li] = { t: ln.text, s: +s.toFixed(3), e, c };
++    prevEnd = e;
++  });
++  return { lines: out, rate: hits / B.length };
++};
++// characters the recogniser missed: interpolate inside a line; across a line break continue / lead in at ~step s per character
++function fillGaps(T, owner, step = 0.15) {
++  const known = []; T.forEach((t, i) => { if (t) known.push(i); });
++  if (!known.length) throw new Error('no lyric matched the song');
++  let ka = -1;
++  for (let i = 0; i < T.length; i++) {
++    if (T[i]) { ka = i; continue; }
++    let kb = i + 1; while (kb < T.length && !T[kb]) kb++;
++    const a = ka >= 0 ? ka : null, b = kb < T.length ? kb : null;
++    let t;
++    if (a != null && b != null && owner[a] === owner[i] && owner[b] === owner[i]) t = T[a][1] + (T[b][0] - T[a][1]) * (i - a) / (b - a);
++    else if (a != null && owner[a] === owner[i]) { t = T[a][1] + step * (i - a - 1); if (b != null) t = Math.min(t, T[b][0] - step * (b - i)); }
++    else if (b != null) { t = T[b][0] - step * (b - i); if (a != null) t = Math.max(t, T[a][1]); }
++    else t = T[a][1] + step * (i - a);
++    t = Math.max(0, t); T[i] = [t, t + step * 0.8];
++  }
++}
++
++/* ---------------- speech recognition in a module worker ---------------- */
++const WORKER = `import { pipeline, env } from '${TF_URL}';
++env.allowLocalModels = false;
++let asr = null, key = '';
++async function load(model, device) {
++  return pipeline('automatic-speech-recognition', model, { device, dtype: device === 'webgpu' ? { encoder_model: 'fp32', decoder_model_merged: 'q4' } : undefined,
++    progress_callback: p => { if (p.status === 'progress' && p.total) self.postMessage({ type: 'load', file: p.file, loaded: p.loaded, total: p.total }); } });
++}
++self.onmessage = async ({ data }) => {
++  try {
++    if (!asr || key !== data.model) {
++      key = data.model;
++      try { asr = await load(data.model, data.webgpu ? 'webgpu' : 'wasm'); } catch (e) { if (!data.webgpu) throw e; asr = await load(data.model, 'wasm'); }
++    }
++    self.postMessage({ type: 'run' });
++    const o = { language: data.lang, task: 'transcribe', chunk_length_s: 30, stride_length_s: 5 };
++    let out;
++    try { out = await asr(data.audio, Object.assign({ return_timestamps: 'word' }, o)); }
++    catch (e) { out = await asr(data.audio, Object.assign({ return_timestamps: true }, o)); }     // models without word timing: phrase level
++    self.postMessage({ type: 'done', chunks: out.chunks || [] });
++  } catch (e) { self.postMessage({ type: 'error', message: String((e && e.message) || e) }); }
++};`;
++let worker = null;
++function recognise(audio, lang, model, onMsg) {
++  if (!worker) worker = new Worker(URL.createObjectURL(new Blob([WORKER], { type: 'text/javascript' })), { type: 'module' });
++  return new Promise((resolve, reject) => {
++    worker.onmessage = ({ data }) => { if (data.type === 'done') resolve(data.chunks); else if (data.type === 'error') reject(new Error(data.message)); else onMsg(data); };
++    worker.onerror = e => { worker = null; reject(new Error(e.message || 'worker error')); };
++    worker.postMessage({ audio, lang, model, webgpu: !!navigator.gpu }, [audio.buffer]);
++  });
++}
++async function to16k(buf) {
++  const n = Math.ceil(buf.duration * 16000), OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
++  const oc = new OAC(1, n, 16000), src = oc.createBufferSource();
++  src.buffer = buf; src.connect(oc.destination); src.start();
++  const r = await oc.startRendering();
++  return new Float32Array(r.getChannelData(0));
++}
++
++/* ---------------- UI: two buttons in 曲とタイミング ---------------- */
++let busy = false;
++function status(text) { const el = $('jzAutoStatus'); el.hidden = !text; el.textContent = text || ''; }
++async function runSync() {
++  const S = J.ui, api = J.uiApi, c = L();
++  if (busy) return;
++  if (!S.audio || !S.audio.buffer) { api.toast(c.noAudio); return; }
++  const lines = S.plan.lines.filter(l => l.index >= 0);
++  if (!lines.some(l => !l.interlude && l.text)) { api.toast(c.noLyrics); return; }
++  busy = true; $('jzAutoSync').disabled = true;
++  const files = {}; let timer = null;
++  try {
++    status(c.prep); api.pause();
++    const audio = await to16k(S.audio.buffer);
++    const lang = J.autoGuessLang(lines.map(l => l.text).join('\n')), t0 = Date.now();
++    const chunks = await recognise(audio, lang, $('jzAutoModel').value, m => {
++      if (m.type === 'load') { files[m.file] = [m.loaded, m.total]; const v = Object.values(files); status(c.load(Math.round(100 * v.reduce((a, x) => a + x[0], 0) / v.reduce((a, x) => a + x[1], 0)))); }
++      if (m.type === 'run') { const r0 = Date.now(); status(c.run(0)); timer = setInterval(() => status(c.run(Math.round((Date.now() - r0) / 1000))), 1000); }
++    });
++    const byIndex = []; lines.forEach(l => { byIndex[l.index] = l; });
++    const R = J.autoTimes(chunks, byIndex.map(l => l || { interlude: true, text: '' }));
++    const T = S.project.timing; T.lineTimes = T.lineTimes || {}; T.auto = {};
++    let n = 0;
++    for (const [li, a] of Object.entries(R.lines)) {
++      T.lineTimes[li] = a.s;
++      if (!a.interlude) { T.auto[li] = a; n++; }
++    }
++    api.replan(); api.flushSave();
++    const rate = Math.round(R.rate * 100);
++    status(c.done(n, rate) + (rate < 55 ? ' — ' + c.low : ''));
++    console.log('[JIZURA auto sync]', lang, ((Date.now() - t0) / 1000).toFixed(1) + 's', chunks.length + ' words', rate + '%');
++  } catch (e) {
++    status(c.fail(e.message)); console.error(e);
++  } finally { clearInterval(timer); busy = false; $('jzAutoSync').disabled = false; }
++}
++
++/* ---------------- one-click After Effects script ---------------- */
++const esc = s => s.replace(/[\u0080-￿]/g, ch => '\\u' + ch.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0'));
++async function panelSource() {
++  const file = document.documentElement.lang === 'ja' ? 'JIZURA_AE.jsx' : 'JIZURA_AE_en.jsx';
++  const here = document.documentElement.lang === 'ja' ? './' : '../';
++  for (const url of [here + file, 'https://raw.githubusercontent.com/852wa/JIZURA/main/' + file]) {
++    try { const r = await fetch(url, { cache: 'no-cache' }); if (r.ok) { const s = await r.text(); if (s.includes('\njzUI(thisObj);')) return s; } } catch (e) {}
++  }
++  J.uiApi.toast(L().jsxFail);
++  return new Promise(resolve => {                                            // offline: let the user pick the panel file
++    const inp = document.createElement('input'); inp.type = 'file'; inp.accept = '.jsx';
++    inp.onchange = async () => { const f = inp.files[0]; const s = f ? await f.text() : ''; resolve(s.includes('\njzUI(thisObj);') ? s : null); };
++    inp.click();
++  });
++}
++const DRIVER = `
++// ---- one-click build (JIZURA web: AE script): the panel's engine builds the plan below, no panel window
++var JA_PLAN = @PLAN@, JA_AUDIO = @AUDIO@;
++(function () {
++    var f = null, item = null, here = null;
++    if (JA_AUDIO) {
++        try { here = File($.fileName).parent; } catch (e0) {}
++        if (here) { f = new File(here.fsName + '/' + JA_AUDIO); if (!f.exists) f = null; }
++        if (!f) f = File.openDialog('JIZURA: ' + JA_AUDIO);
++    }
++    if (!app.project) app.newProject();
++    app.beginUndoGroup('JIZURA');
++    try { if (f) item = app.project.importFile(new ImportOptions(f)); } catch (e1) { alert('JIZURA: ' + e1.toString()); }
++    app.endUndoGroup();
++    var w = null, bar = null, job = null;
++    try { w = new Window('palette', 'JIZURA'); bar = w.add('progressbar', undefined, 0, JA_PLAN.cuts.length || 1); bar.preferredSize.width = 320; w.show(); } catch (e2) { w = null; }
++    app.beginUndoGroup('JIZURA build');
++    try {
++        job = jzBuildStart(JA_PLAN, { roles: JZ_ROLE_DEFAULT, audioItem: item, audioStart: -(+JA_PLAN.audioOffset || 0), light: false });
++        while (!job.finished) { job.step(700); if (bar) { bar.value = job.done || 0; try { w.update(); } catch (e3) {} } }
++    } catch (e4) { alert('JIZURA: ' + e4.toString() + (e4.line ? ' (line ' + e4.line + ')' : '')); }
++    finally { app.endUndoGroup(); if (w) w.close(); }
++    if (!job || !job.comp) return;
++    $.global.JZ_LAST_COMP = job.comp;
++    try { job.comp.openInViewer(); } catch (e5) {}
++    var mf = jzMissingFonts(), msg = 'JIZURA: ' + job.comp.name + ' (' + JA_PLAN.cuts.length + ' cuts)';
++    if (mf.length) msg += '\\n\\nFonts substituted (install from fonts.google.com): ' + mf.join(', ');
++    if (JZLOG.length) msg += '\\n\\n' + JZLOG.slice(0, 10).join('\\n');
++    alert(msg);
++})();
++`;
++J.aeScript = (panel, plan, audioName) => panel.replace('\njzUI(thisObj);', '\n' + DRIVER.replace('@PLAN@', () => esc(JSON.stringify(plan))).replace('@AUDIO@', () => esc(JSON.stringify(audioName || ''))));
++async function exportJsx() {
++  const S = J.ui, api = J.uiApi, c = L();
++  if (busy) return;
++  busy = true; status(c.jsxGet);
++  try {
++    const panel = await panelSource();
++    if (!panel) { status(c.jsxFail); return; }
++    const plan = J.planForAE(S.plan, S.project, api.exportRange());
++    const name = (String(S.project.title || '').trim() || (S.project.audioName || 'lyric').replace(/\.[^.]+$/, '') || 'lyric').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 60) + '_JIZURA.jsx';
++    await J.saveFile(name, J.aeScript(panel, plan, S.project.audioName || ''));
++    status(c.jsxDone(name));
++  } catch (e) { status(c.fail(e.message)); console.error(e); }
++  finally { busy = false; }
++}
++
++function mount() {
++  if (!J.ui || !J.ui.project || !J.uiApi) { setTimeout(mount, 60); return; }
++  const tapRow = $('btnTap') && $('btnTap').closest('.row');
++  if (!tapRow || $('jzAutoSync')) return;
++  const c = L(), row = document.createElement('div');
++  row.className = 'row jz-auto';
++  row.innerHTML = `<button id="jzAutoSync" class="primary" title="${c.tipSync}">✦ ${c.sync}</button>`
++    + `<select id="jzAutoModel" aria-label="${c.model}" title="${c.model}">${MODELS.map(([v, n]) => `<option value="${v}">${n}</option>`).join('')}</select>`
++    + `<button id="jzAutoJsx" title="${c.tipJsx}">${c.jsx}</button>`;
++  const st = document.createElement('div'); st.id = 'jzAutoStatus'; st.className = 'muted jz-auto-status'; st.hidden = true; st.setAttribute('role', 'status');
++  tapRow.after(row, st);
++  try { const m = localStorage.getItem('jizura.autoModel'); if (m && MODELS.some(x => x[0] === m)) $('jzAutoModel').value = m; } catch (e) {}
++  $('jzAutoModel').addEventListener('change', e => { try { localStorage.setItem('jizura.autoModel', e.target.value); } catch (er) {} });
++  $('jzAutoSync').addEventListener('click', runSync);
++  $('jzAutoJsx').addEventListener('click', exportJsx);
++}
++if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount); else mount();
++})();
